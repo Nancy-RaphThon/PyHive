@@ -79,7 +79,7 @@ class Cursor(common.DBAPICursor):
 
     def __init__(self, host, port='8080', username=None, catalog='hive',
                  schema='default', poll_interval=1, source='pyhive', session_props=None,
-                 protocol='http', password=None):
+                 protocol='http', proxies={}, password=None, cert=None, verifycert=None):
         """
         :param host: hostname to connect to, e.g. ``presto.example.com``
         :param port: int -- port, defaults to 8080
@@ -92,6 +92,9 @@ class Cursor(common.DBAPICursor):
         :param protocol: string -- network protocol, valid options are ``http`` and ``https``.
             defaults to ``http``
         :param password: string -- defaults to ``None``, using BasicAuth, requires ``https``
+        :param cert: string -- full path for HTTPS certificate, defaults to None
+        :param verifycert: string -- verify if the certificate is valid, defaults to True
+        :param proxies: string -- dictionary with HTTP and HTTPS proxies, defaults to an empty dictionary
         """
         super(Cursor, self).__init__(poll_interval)
         # Config
@@ -100,6 +103,7 @@ class Cursor(common.DBAPICursor):
         self._username = username or getpass.getuser()
         self._password = password
         self._catalog = catalog
+        self._cert = cert
         self._schema = schema
         self._arraysize = 1
         self._poll_interval = poll_interval
@@ -108,12 +112,25 @@ class Cursor(common.DBAPICursor):
         if protocol not in ('http', 'https'):
             raise ValueError("Protocol must be http/https, was {!r}".format(protocol))
         self._protocol = protocol
+        self._proxies = {}
+        if "http" in proxies:
+            self._proxies["http"] = proxies["http"]
+            if proxies["http"] == "None":
+                self._proxies["http"] = None
+        if "https" in proxies:
+            self._proxies["https"] = proxies["https"]
+            if proxies["https"] == "None":
+                self._proxies["https"] = None
+
         if password is None:
             self._auth = None
         else:
             self._auth = HTTPBasicAuth(username, self._password)
             if protocol != 'https':
                 raise ValueError("Protocol must be https when passing a password")
+        self._verifycert = True
+        if verifycert == "False" or verifycert == False:
+            self._verifycert = False
         self._reset_state()
 
     def _reset_state(self):
@@ -179,12 +196,15 @@ class Cursor(common.DBAPICursor):
         self._reset_state()
 
         self._state = self._STATE_RUNNING
+        if self._cert is not None:
+            self._protocol = 'https'
+            header['Authorization'] = "Basic %s" % base64.b64encode('%s:%s' % (self._username, self._password))
         url = urlparse.urlunparse((
             self._protocol,
             '{}:{}'.format(self._host, self._port), '/v1/statement', None, None, None))
         _logger.info('%s', sql)
         _logger.debug("Headers: %s", headers)
-        response = requests.post(url, data=sql.encode('utf-8'), headers=headers, auth=self._auth)
+        response = requests.post(url, data=sql.encode('utf-8'), headers=headers, auth=self._auth, proxies=self._proxies, cert=self._cert, verify=self._verify)
         self._process_response(response)
 
     def cancel(self):
@@ -216,13 +236,71 @@ class Cursor(common.DBAPICursor):
         if self._nextUri is None:
             assert self._state == self._STATE_FINISHED, "Should be finished if nextUri is None"
             return None
-        response = requests.get(self._nextUri, auth=self._auth)
+        headers = {'Authorization': "Basic %s" % base64.b64encode('%s:%s' % (self._username, self._password))}
+        response = requests.get(self._nextUri, headers=headers, auth=self._auth, proxies=self._proxies, cert=self._cert, verify=self._verifycert)
         self._process_response(response)
         return response.json()
 
+    def cluster(self, parameters=None):
+        """Get list of queries (query or command).
+
+        Return values are not defined.
+        """
+        headers = {
+            'X-Presto-Catalog': self._catalog,
+            'X-Presto-Schema': self._schema,
+            'X-Presto-Source': self._source,
+            'X-Presto-User': self._username,
+        }
+
+        if self._session_props:
+            headers['X-Presto-Session'] = ','.join(
+                '{}={}'.format(propname, propval)
+                for propname, propval in self._session_props.items()
+            )
+
+        self._reset_state()
+
+        self._state = self._STATE_RUNNING
+        url = urlparse.urlunparse((
+            'http', '{}:{}'.format(self._host, self._port), '/v1/cluster', None, None, None))
+        _logger.debug("Headers: %s", headers)
+        response = requests.get(url, headers=headers)
+        _res = response.json()
+        return _res
+
+    def query(self, parameters=None):
+        """Get list of queries (query or command).
+
+        Return values are not defined.
+        """
+        headers = {
+            'X-Presto-Catalog': self._catalog,
+            'X-Presto-Schema': self._schema,
+            'X-Presto-Source': self._source,
+            'X-Presto-User': self._username,
+        }
+
+        if self._session_props:
+            headers['X-Presto-Session'] = ','.join(
+                '{}={}'.format(propname, propval)
+                for propname, propval in self._session_props.items()
+            )
+
+        self._reset_state()
+
+        self._state = self._STATE_RUNNING
+        url = urlparse.urlunparse((
+            'http', '{}:{}'.format(self._host, self._port), '/v1/query', None, None, None))
+        _logger.debug("Headers: %s", headers)
+        response = requests.get(url, headers=headers)
+        _res = response.json()
+        return _res
+
     def _fetch_more(self):
         """Fetch the next URI and update state"""
-        self._process_response(requests.get(self._nextUri, auth=self._auth))
+        headers = {'Authorization': "Basic %s" % base64.b64encode('%s:%s' % (self._username, self._password))}
+        self._process_response(requests.get(self._nextUri, headers=headers, auth=self._auth, proxies=self._proxies, cert=self._cert, verify=self._verifycert))
 
     def _decode_binary(self, rows):
         # As of Presto 0.69, binary data is returned as the varbinary type in base64 format
